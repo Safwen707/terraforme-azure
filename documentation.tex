@@ -1,0 +1,600 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{fancyhdr}
+
+\geometry{margin=2.5cm}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10},
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{green!60!black},
+  stringstyle=\color{red},
+  showstringspaces=false
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{Déploiement Infrastructure Azure avec Terraform}
+\lhead{Documentation Technique}
+\cfoot{\thepage}
+
+\title{\textbf{Déploiement d'une Infrastructure Azure Complète avec Terraform} \\
+\large Résolution de problèmes, apprentissages et bonnes pratiques}
+\author{Safwen — Projet terraforme-azure}
+\date{3 novembre 2025}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+Ce document retrace le processus complet de déploiement d'une infrastructure Azure avec Terraform, incluant tous les problèmes rencontrés, leurs résolutions et les apprentissages clés. Le projet vise à automatiser le provisioning d'un environnement réseau sécurisé avec une VM Linux (Ubuntu 22.04) configurée pour Docker.
+
+\subsection{Objectifs du projet}
+\begin{itemize}
+    \item Déployer une infrastructure réseau complète sur Azure de manière déclarative
+    \item Automatiser l'installation de Docker via cloud-init
+    \item Apprendre Terraform, gestion SSH, et résolution de problèmes cloud
+    \item Créer une base reproductible pour des environnements de dev/test
+\end{itemize}
+
+\section{Configuration initiale et problèmes d'authentification}
+
+\subsection{Problème : subscription\_id manquant}
+
+\textbf{Erreur rencontrée :}
+\begin{lstlisting}[language=bash]
+Error: `subscription_id` is a required provider property 
+when performing a plan/apply operation
+\end{lstlisting}
+
+\textbf{Cause :} Terraform ne trouvait pas l'ID de souscription Azure nécessaire pour authentifier les appels API.
+
+\textbf{Solution appliquée :}
+\begin{enumerate}
+    \item Vérification de l'ID de souscription via Azure CLI :
+\begin{lstlisting}[language=bash]
+az account show
+\end{lstlisting}
+    
+    \item Export de la variable d'environnement :
+\begin{lstlisting}[language=bash]
+export ARM_SUBSCRIPTION_ID="d4766098-cffb-4cbd-bc57-ecac05f4e728"
+\end{lstlisting}
+    
+    \item Ajout permanent dans \texttt{\textasciitilde/.bashrc} :
+\begin{lstlisting}[language=bash]
+echo 'export ARM_SUBSCRIPTION_ID="d4766098..."' >> ~/.bashrc
+source ~/.bashrc
+\end{lstlisting}
+\end{enumerate}
+
+\textbf{Apprentissage :} Azure provider nécessite soit des variables ARM\_*, soit une authentification Azure CLI active. La variable d'environnement est la méthode recommandée pour scripts automatisés.
+
+\subsection{Création d'alias Terraform}
+
+Pour simplifier les commandes répétitives :
+\begin{lstlisting}[language=bash]
+echo 'alias ter="terraform"' >> ~/.bashrc
+source ~/.bashrc
+\end{lstlisting}
+
+\section{Architecture de l'infrastructure déployée}
+
+\subsection{Ressources Terraform créées}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|p{8cm}|}
+\hline
+\textbf{Ressource} & \textbf{Description} \\
+\hline
+\texttt{azurerm\_resource\_group} & Conteneur logique pour centraliser et gérer les ressources \\
+\hline
+\texttt{azurerm\_virtual\_network} & Réseau virtuel isolant les ressources (CIDR: 10.123.0.0/16) \\
+\hline
+\texttt{azurerm\_subnet} & Sous-réseau pour segmentation (CIDR: 10.123.1.0/24) \\
+\hline
+\texttt{azurerm\_network\_security\_group} & Ensemble de règles firewall \\
+\hline
+\texttt{azurerm\_network\_security\_rule} & Règle SSH (port 22, priorité 100) \\
+\hline
+\texttt{azurerm\_subnet\_nsg\_association} & Liaison NSG→Subnet \\
+\hline
+\texttt{azurerm\_public\_ip} & Adresse IP publique statique \\
+\hline
+\texttt{azurerm\_network\_interface} & Interface réseau reliant VM au subnet/IP publique \\
+\hline
+\texttt{azurerm\_linux\_virtual\_machine} & VM Ubuntu 22.04 (Standard\_B1s) \\
+\hline
+\texttt{data.azurerm\_public\_ips} & Data source pour récupérer info IP publique \\
+\hline
+\end{tabular}
+\caption{Ressources Terraform déployées}
+\end{table}
+
+\subsection{Schéma réseau}
+
+\begin{verbatim}
+INTERNET
+    ↓
+[Public IP: 4.219.12.136 - Static]
+    ↓
+[Network Interface: mtc-nic]
+    ↓
+[Subnet: 10.123.1.0/24]
+    ├── Private IP: 10.123.1.4 (Dynamic)
+    └── NSG: mtc-nsg (règle SSH port 22)
+    ↓
+[Virtual Network: 10.123.0.0/16]
+    ↓
+[Resource Group: mtc-rg]
+\end{verbatim}
+
+\section{Concepts clés expliqués}
+
+\subsection{Notation CIDR et calcul d'adresses}
+
+\textbf{Formule :} Nombre d'adresses = $2^{(32-X)} - 2$
+
+\textbf{Exemples :}
+\begin{itemize}
+    \item \texttt{10.123.0.0/16} : $2^{16}$ = 65,536 adresses
+    \item \texttt{10.123.1.0/24} : $2^{8}$ = 256 adresses (254 utilisables)
+    \item \texttt{172.16.0.0/12} : $2^{20}$ = 1,048,576 adresses
+\end{itemize}
+
+\subsection{Direction de trafic réseau}
+
+\begin{itemize}
+    \item \textbf{Inbound} : Trafic entrant vers votre serveur (ex: connexion SSH depuis Internet)
+    \item \textbf{Outbound} : Trafic sortant de votre serveur (ex: téléchargement de packages)
+\end{itemize}
+
+\textbf{Règles par défaut Azure :}
+\begin{itemize}
+    \item Inbound : TOUT bloqué sauf règles explicites
+    \item Outbound : TOUT autorisé par défaut
+\end{itemize}
+
+\subsection{Private IP vs Public IP}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Type} & \textbf{Private IP} & \textbf{Public IP} \\
+\hline
+Visibilité & Interne VNet uniquement & Internet \\
+\hline
+Adresse & 10.123.1.4 & 4.219.12.136 \\
+\hline
+Allocation & Dynamic/Static & Dynamic/Static \\
+\hline
+Usage & Communication inter-VM & Accès externe \\
+\hline
+\end{tabular}
+\caption{Comparaison Private vs Public IP}
+\end{table}
+
+\section{Problèmes rencontrés et résolutions}
+
+\subsection{Problème 1 : Limite SKU Public IP Basic}
+
+\textbf{Erreur :}
+\begin{lstlisting}
+Error: static IP allocation must be used when creating 
+Standard SKU public IP addresses
+\end{lstlisting}
+
+\textbf{Cause :} Tentative de créer une Public IP avec SKU Standard et allocation Dynamic (incompatible).
+
+\textbf{Résolution :}
+\begin{lstlisting}[language=terraform]
+resource "azurerm_public_ip" "mtc-ip" {
+  allocation_method = "Static"  # Requis pour Standard
+  sku              = "Standard"  # ou Basic avec Dynamic
+}
+\end{lstlisting}
+
+\textbf{Apprentissage :} Azure a des quotas stricts par région/subscription. Basic SKU peut être limité à 0 dans certaines régions. Standard nécessite allocation statique.
+
+\subsection{Problème 2 : Références incorrectes dans Terraform}
+
+\textbf{Erreur initiale :}
+\begin{lstlisting}[language=terraform]
+resource_group_name = azurerm_resource_group.example.name
+network_interface_ids = [azurerm_network_interface.mtc-vm.id]
+\end{lstlisting}
+
+\textbf{Problème :} Références à des ressources inexistantes ("example", "mtc-vm" au lieu de "mtc-nic").
+
+\textbf{Solution :}
+\begin{lstlisting}[language=terraform]
+resource_group_name = azurerm_resource_group.mtc-rg.name
+network_interface_ids = [azurerm_network_interface.mtc-nic.id]
+\end{lstlisting}
+
+\textbf{Principe des références Terraform :}
+\begin{lstlisting}
+resource_type.resource_name.attribute
+\end{lstlisting}
+
+\subsection{Problème 3 : Connection timeout SSH}
+
+\textbf{Symptôme :} "Could not establish connection to 'mtc-vm': The connection timed out."
+
+\textbf{Causes possibles identifiées :}
+\begin{enumerate}
+    \item VM en cours de provisioning (cloud-init install Docker)
+    \item Host key changed (VM recréée)
+    \item Clé SSH incorrecte ou corrompue
+    \item NSG mal configuré
+\end{enumerate}
+
+\textbf{Solutions appliquées :}
+
+\textbf{1. Nettoyage known\_hosts :}
+\begin{lstlisting}[language=bash]
+ssh-keygen -f ~/.ssh/known_hosts -R "4.219.12.136"
+\end{lstlisting}
+
+\textbf{2. Régénération des clés SSH :}
+\begin{lstlisting}[language=bash]
+# Sauvegarde anciennes clés
+mv ~/.ssh/id_rsa ~/.ssh/id_rsa.backup
+mv ~/.ssh/id_rsa.pub ~/.ssh/id_rsa.pub.backup
+
+# Nouvelle paire
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ''
+chmod 600 ~/.ssh/id_rsa
+chmod 644 ~/.ssh/id_rsa.pub
+\end{lstlisting}
+
+\textbf{3. Recréation ciblée de la VM :}
+\begin{lstlisting}[language=bash]
+ter destroy -target=azurerm_linux_virtual_machine.mtc-vm -auto-approve
+ter apply -target=azurerm_linux_virtual_machine.mtc-vm -auto-approve
+\end{lstlisting}
+
+\textbf{4. Configuration SSH optimisée :}
+\begin{lstlisting}[language=bash]
+# ~/.ssh/config
+Host mtc-vm
+  HostName 4.219.12.136
+  User adminuser
+  IdentityFile ~/.ssh/id_rsa
+  GSSAPIAuthentication no
+  ConnectTimeout 10
+  ServerAliveInterval 60
+\end{lstlisting}
+
+\subsection{Problème 4 : VS Code Remote SSH}
+
+\textbf{Symptôme :} VS Code Remote ne se connecte pas ou ne montre pas "adminuser@mtc-vm" dans le terminal.
+
+\textbf{Solution complète :}
+\begin{enumerate}
+    \item Ajout d'un host nommé dans \texttt{\textasciitilde/.ssh/config}
+    \item Suppression des entrées known\_hosts obsolètes
+    \item Génération de nouvelles clés SSH
+    \item Recréation de la VM avec nouvelles clés
+    \item Connexion via le nom "mtc-vm" plutôt que l'IP
+\end{enumerate}
+
+\section{Provisioning et cloud-init}
+
+\subsection{Fichier customdata.tpl}
+
+Script cloud-init pour installer Docker automatiquement :
+
+\begin{lstlisting}[language=bash]
+#!/bin/bash
+sudo apt-get update -y &&
+sudo apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg-agent \
+    software-properties-common &&
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | sudo apt-key add - &&
+sudo add-apt-repository \
+    "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) stable" &&
+sudo apt-get update -y &&
+sudo apt-get install docker-ce docker-ce-cli containerd.io -y &&
+sudo usermod -aG docker ubuntu
+\end{lstlisting}
+
+\textbf{Intégration dans main.tf :}
+\begin{lstlisting}[language=terraform]
+resource "azurerm_linux_virtual_machine" "mtc-vm" {
+  # ... autres configs
+  custom_data = base64encode(file("${path.module}/customdata.tpl"))
+}
+\end{lstlisting}
+
+\subsection{Provisioners vs cloud-init}
+
+\textbf{Provisioners Terraform :}
+\begin{itemize}
+    \item \texttt{local-exec} : exécute sur la machine qui lance Terraform
+    \item \texttt{remote-exec} : exécute sur la ressource distante via SSH
+    \item \texttt{file} : transfère des fichiers
+\end{itemize}
+
+\textbf{Problèmes des provisioners :}
+\begin{itemize}
+    \item Non-idempotents
+    \item Dépendent de la connectivité SSH
+    \item Fragiles et difficiles à déboguer
+    \item Comportement impératif (anti-pattern IaC)
+\end{itemize}
+
+\textbf{Alternatives recommandées :}
+\begin{enumerate}
+    \item \textbf{cloud-init} (custom\_data) : exécution au boot, idempotent
+    \item \textbf{VM extensions Azure} : mécanisme natif Azure
+    \item \textbf{Images pré-configurées} (golden images via Packer)
+    \item \textbf{Outils externes} : Ansible, Chef, Puppet post-déploiement
+\end{enumerate}
+
+\section{Gestion de l'état Terraform}
+
+\subsection{Fichier terraform.tfstate}
+
+Le fichier \texttt{terraform.tfstate} contient :
+\begin{itemize}
+    \item Mapping entre code Terraform et ressources réelles
+    \item IDs des ressources créées
+    \item Métadonnées (timestamps, versions)
+    \item Parfois des secrets (attention !)
+\end{itemize}
+
+\textbf{Commandes utiles :}
+\begin{lstlisting}[language=bash]
+# Lister les ressources
+ter state list
+
+# Afficher une ressource
+ter state show azurerm_public_ip.mtc-ip
+
+# Rafraîchir l'état
+ter apply -refresh-only
+\end{lstlisting}
+
+\textbf{Bonnes pratiques :}
+\begin{itemize}
+    \item Ne JAMAIS committer \texttt{terraform.tfstate} dans un repo public
+    \item Utiliser un backend distant (Azure Blob, S3) pour équipes
+    \item Activer le locking pour éviter les modifications concurrentes
+    \item Faire des backups réguliers du state
+\end{itemize}
+
+\section{Workflow Terraform complet}
+
+\subsection{Commandes essentielles}
+
+\begin{lstlisting}[language=bash]
+# Initialisation (télécharge providers)
+terraform init
+
+# Validation syntaxe
+terraform validate
+
+# Planification (dry-run)
+terraform plan
+
+# Application des changements
+terraform apply
+
+# Application automatique (sans confirmation)
+terraform apply -auto-approve
+
+# Destruction de ressources spécifiques
+terraform destroy -target=azurerm_linux_virtual_machine.mtc-vm
+
+# Destruction complète
+terraform destroy
+\end{lstlisting}
+
+\subsection{Cycle de vie typique}
+
+\begin{enumerate}
+    \item Écrire/modifier \texttt{main.tf}
+    \item \texttt{ter validate} : vérifier syntaxe
+    \item \texttt{ter plan} : voir les changements prévus
+    \item Réviser le plan attentivement
+    \item \texttt{ter apply} : appliquer si satisfait
+    \item \texttt{ter state list} : vérifier l'état
+    \item Tester l'infrastructure (SSH, services, etc.)
+    \item Commit du code (pas du state !)
+\end{enumerate}
+
+\section{Tags et organisation}
+
+\subsection{Utilité des tags Azure}
+
+\begin{lstlisting}[language=terraform]
+tags = {
+  environment = "dev"
+  project     = "terraform-learning"
+  owner       = "safsaf"
+  cost-center = "learning"
+}
+\end{lstlisting}
+
+\textbf{Bénéfices :}
+\begin{itemize}
+    \item Filtrage et recherche de ressources
+    \item Suivi des coûts par environnement/projet
+    \item Automatisation (ex: arrêt automatique des ressources dev)
+    \item Documentation et responsabilité
+    \item Facturation par département
+\end{itemize}
+
+\section{Apprentissages et bonnes pratiques}
+
+\subsection{Leçons clés}
+
+\begin{enumerate}
+    \item \textbf{Infrastructure as Code} : reproductibilité, versioning, documentation automatique
+    
+    \item \textbf{Gestion des dépendances} : Terraform gère automatiquement l'ordre de création via références
+    
+    \item \textbf{Quotas cloud} : toujours vérifier les limitations régionales/subscription
+    
+    \item \textbf{SSH et clés} : configuration propre (\texttt{\textasciitilde/.ssh/config}) essentielle pour productivité
+    
+    \item \textbf{Provisioning robuste} : préférer cloud-init/VM extensions aux provisioners
+    
+    \item \textbf{Debugging méthodique} : 
+    \begin{itemize}
+        \item Lire les logs (\texttt{/var/log/cloud-init.log})
+        \item Utiliser serial console Azure si SSH impossible
+        \item Tester par couches (réseau, NSG, SSH, services)
+    \end{itemize}
+    
+    \item \textbf{Sécurité} :
+    \begin{itemize}
+        \item Ne jamais exposer de secrets dans le code
+        \item Utiliser Azure Key Vault pour secrets
+        \item Limiter les règles NSG au strict nécessaire
+        \item Rotation régulière des clés SSH
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Commandes de dépannage essentielles}
+
+\begin{lstlisting}[language=bash]
+# Vérifier état Azure
+az account show
+
+# Vérifier IP publique
+ter state show azurerm_public_ip.mtc-ip
+
+# Tester connectivité SSH avec verbose
+ssh -vvv -i ~/.ssh/id_rsa adminuser@4.219.12.136
+
+# Vérifier NSG
+ter state show azurerm_network_security_rule.mtc-nsg-rule
+
+# Logs cloud-init (une fois connecté en SSH)
+sudo cat /var/log/cloud-init.log
+sudo cloud-init status
+
+# État Docker
+docker --version
+docker ps
+\end{lstlisting}
+
+\section{Résultats et outcomes personnels}
+
+\subsection{Infrastructure finale}
+
+\begin{itemize}
+    \item Resource Group créé : \texttt{mtc-rg}
+    \item VNet avec CIDR \texttt{10.123.0.0/16}
+    \item Subnet avec CIDR \texttt{10.123.1.0/24}
+    \item NSG avec règle SSH (port 22)
+    \item Public IP statique : \texttt{4.219.12.136}
+    \item VM Ubuntu 22.04 avec Docker installé
+    \item Connexion SSH fonctionnelle
+    \item VS Code Remote opérationnel
+\end{itemize}
+
+\subsection{Compétences acquises}
+
+\begin{enumerate}
+    \item \textbf{Terraform} : syntaxe HCL, resources, data sources, références, state management
+    \item \textbf{Azure} : concepts réseau (VNet, Subnet, NSG), quotas, SKU
+    \item \textbf{Réseau} : CIDR, private/public IP, firewall rules, inbound/outbound
+    \item \textbf{SSH} : configuration, clés, known\_hosts, troubleshooting
+    \item \textbf{cloud-init} : bootstrapping automatique, scripting
+    \item \textbf{Docker} : installation automatisée, version management
+    \item \textbf{Debugging cloud} : logs, serial console, méthodologie systématique
+    \item \textbf{DevOps} : IaC, reproductibilité, versioning, automation
+\end{enumerate}
+
+\subsection{Valeur ajoutée du projet}
+
+\begin{itemize}
+    \item Infra reproductible en quelques commandes (\texttt{ter init/apply})
+    \item Gain de temps pour environnements dev/test
+    \item Base solide pour projets futurs (CI/CD, microservices, etc.)
+    \item Documentation complète et réutilisable
+    \item Compétences transférables à d'autres clouds (AWS, GCP)
+\end{itemize}
+
+\section{Pour aller plus loin}
+
+\subsection{Améliorations possibles}
+
+\begin{enumerate}
+    \item \textbf{Backend distant} : stocker state dans Azure Blob Storage
+    \begin{lstlisting}[language=terraform]
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "terraform-state-rg"
+    storage_account_name = "tfstatestorage"
+    container_name       = "tfstate"
+    key                  = "prod.terraform.tfstate"
+  }
+}
+    \end{lstlisting}
+    
+    \item \textbf{Variables et modules} : rendre le code réutilisable
+    \begin{lstlisting}[language=terraform]
+variable "location" {
+  type    = string
+  default = "norwayeast"
+}
+
+variable "vm_size" {
+  type    = string
+  default = "Standard_B1s"
+}
+    \end{lstlisting}
+    
+    \item \textbf{CI/CD} : automatiser déploiement via GitHub Actions
+    \item \textbf{Multi-environnements} : workspaces Terraform (dev, staging, prod)
+    \item \textbf{Monitoring} : Azure Monitor, alertes, dashboards
+    \item \textbf{Scaling} : load balancer, VM scale sets
+    \item \textbf{Backup} : politiques de sauvegarde automatisées
+\end{enumerate}
+
+\section{Conclusion}
+
+Ce projet a permis de déployer avec succès une infrastructure Azure complète et sécurisée via Terraform. Les nombreux problèmes rencontrés (authentification, SKU, SSH, cloud-init) ont été méthodiquement résolus, aboutissant à une infrastructure reproductible et documentée.
+
+L'approche Infrastructure-as-Code démontre sa valeur : rapidité de déploiement, versioning, documentation automatique et capacité à reproduire des environnements identiques.
+
+Les compétences acquises (Terraform, Azure, réseau, SSH, debugging) sont directement applicables à des projets professionnels et constituent une base solide pour des architectures cloud plus complexes.
+
+\subsection{Ressources finales}
+
+Repository GitHub : \url{https://github.com/Safwen707/terraforme-azure}
+
+Fichiers principaux :
+\begin{itemize}
+    \item \texttt{main.tf} : configuration Terraform complète
+    \item \texttt{customdata.tpl} : script cloud-init Docker
+    \item \texttt{ubuntu-ssh-script.tpl} : configuration SSH automatique
+    \item \texttt{README.md} : documentation d'usage
+    \item \texttt{documentation.tex} : ce document
+\end{itemize}
+
+\end{document}
